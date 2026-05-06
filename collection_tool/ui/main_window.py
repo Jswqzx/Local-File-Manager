@@ -15,7 +15,12 @@ from ..services import (
     format_size,
     is_path_within,
 )
-from ..storage import load_file_update_rows, save_file_update_rows
+from ..storage import (
+    load_file_update_rows,
+    load_site_rules,
+    save_file_update_rows,
+    save_site_rules,
+)
 from .dialogs import show_file_update_dialog, show_rename_preview_dialog
 from .layout import build_main_layout
 from .results_view import (
@@ -42,6 +47,7 @@ class MainWindow(QMainWindow):
         self.detail_override_title: str | None = None
         self.updating_select_all_checkboxes = False
         self.request_rows: list[dict[str, str]] = load_file_update_rows()
+        self.site_rules: dict[str, list[dict[str, str]]] = load_site_rules()
 
         self.setCentralWidget(build_main_layout(self))
         self.connect_signals()
@@ -269,12 +275,13 @@ class MainWindow(QMainWindow):
         show_rename_preview_dialog(self, rename_pairs, skipped_paths)
 
     def open_url_params_dialog(self) -> None:
-        result = show_file_update_dialog(self, self.request_rows)
+        result = show_file_update_dialog(self, self.request_rows, self.site_rules)
         if result is None:
             return
 
-        self.request_rows = result
+        self.request_rows, self.site_rules = result
         save_file_update_rows(self.request_rows)
+        save_site_rules(self.site_rules)
 
         if self.request_rows:
             configured_params = sum(1 for row in self.request_rows if row.get("params", "").strip())

@@ -1,0 +1,9 @@
+{
+  "https://misskon.com/page/1/?": [
+    {
+      "site_name": "www.sample.com",
+      "match_url": "",
+      "rule_json": "{\n  \"step\": 1,\n  \"target\": \"article.item-list\",\n  \"link_selector\": \"a\",\n  \"attr\": \"href\"\n}"
+    }
+  ]
+}

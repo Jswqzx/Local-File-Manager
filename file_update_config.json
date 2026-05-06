@@ -1,6 +1,10 @@
 [
   {
+    "url": "https://misskon.com/page/1/?",
+    "params": "s=%E8%A0%A2%E6%B2%AB%E6%B2%AB"
+  },
+  {
     "url": "https://www.baidu.com/s?",
-    "params": "wd="
+    "params": "wd=Test"
   }
 ]
