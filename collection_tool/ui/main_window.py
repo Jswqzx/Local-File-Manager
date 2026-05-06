@@ -15,7 +15,8 @@ from ..services import (
     format_size,
     is_path_within,
 )
-from .dialogs import show_rename_preview_dialog, show_url_params_dialog
+from ..storage import load_file_update_rows, save_file_update_rows
+from .dialogs import show_file_update_dialog, show_rename_preview_dialog
 from .layout import build_main_layout
 from .results_view import (
     collect_selected_paths,
@@ -40,8 +41,7 @@ class MainWindow(QMainWindow):
         self.detail_override_entries: list[EntryRecord] | None = None
         self.detail_override_title: str | None = None
         self.updating_select_all_checkboxes = False
-        self.request_url = ""
-        self.request_params = ""
+        self.request_rows: list[dict[str, str]] = load_file_update_rows()
 
         self.setCentralWidget(build_main_layout(self))
         self.connect_signals()
@@ -269,18 +269,21 @@ class MainWindow(QMainWindow):
         show_rename_preview_dialog(self, rename_pairs, skipped_paths)
 
     def open_url_params_dialog(self) -> None:
-        result = show_url_params_dialog(self, self.request_url, self.request_params)
+        result = show_file_update_dialog(self, self.request_rows)
         if result is None:
             return
 
-        self.request_url, self.request_params = result
-        if self.request_url:
+        self.request_rows = result
+        save_file_update_rows(self.request_rows)
+
+        if self.request_rows:
+            configured_params = sum(1 for row in self.request_rows if row.get("params", "").strip())
             self.status_label.setText(
-                f"已保存网址参数配置: {self.request_url}"
-                + (" | 已填写参数" if self.request_params else "")
+                f"已保存文件更新配置: {len(self.request_rows)} 个网址"
+                + (f" | 已配置参数 {configured_params} 项" if configured_params else "")
             )
         else:
-            self.status_label.setText("已清空网址参数配置。")
+            self.status_label.setText("已清空文件更新配置。")
 
     def show_selected_folder_files(self) -> None:
         item = self.group_tree.currentItem()
