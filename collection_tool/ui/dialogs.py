@@ -1,15 +1,19 @@
-import json
+﻿import json
 import re
 from pathlib import Path
+from typing import Callable
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
+    QApplication,
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QFileDialog,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -17,6 +21,7 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QTableWidget,
     QTreeWidget,
@@ -92,6 +97,68 @@ def show_params_input_dialog(parent: QWidget, current_params: str) -> str | None
     return params_input.toPlainText().strip()
 
 
+def show_html_filter_dialog(parent: QWidget) -> dict[str, object] | None:
+    dialog = QDialog(parent)
+    dialog.setWindowTitle("导出 HTML 设置")
+    dialog.resize(420, 320)
+
+    layout = QVBoxLayout(dialog)
+    layout.setContentsMargins(12, 12, 12, 12)
+    layout.setSpacing(8)
+
+    tip_label = QLabel("输入目标网址，并勾选需要过滤的内容后保存导出。")
+    layout.addWidget(tip_label)
+
+    url_input = QLineEdit()
+    url_input.setPlaceholderText("输入需要导出 HTML 的目标网址")
+    layout.addWidget(url_input)
+
+    comment_checkbox = QCheckBox("过滤 HTML 注释")
+    comment_checkbox.setChecked(True)
+    script_checkbox = QCheckBox("过滤 JS script 标签")
+    script_checkbox.setChecked(True)
+    style_checkbox = QCheckBox("过滤 style 标签")
+    style_checkbox.setChecked(True)
+    stylesheet_checkbox = QCheckBox("过滤 CSS link 标签")
+    stylesheet_checkbox.setChecked(True)
+    noscript_checkbox = QCheckBox("过滤 noscript 标签")
+    noscript_checkbox.setChecked(True)
+
+    layout.addWidget(comment_checkbox)
+    layout.addWidget(script_checkbox)
+    layout.addWidget(style_checkbox)
+    layout.addWidget(stylesheet_checkbox)
+    layout.addWidget(noscript_checkbox)
+
+    button_row = QHBoxLayout()
+    save_button = QPushButton("保存")
+    close_button = QPushButton("关闭")
+    button_row.addStretch()
+    button_row.addWidget(save_button)
+    button_row.addWidget(close_button)
+    layout.addLayout(button_row)
+
+    save_button.clicked.connect(dialog.accept)
+    close_button.clicked.connect(dialog.reject)
+
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return None
+
+    export_url = url_input.text().strip()
+    if not export_url:
+        QMessageBox.warning(parent, "提示", "请输入目标网址。")
+        return None
+
+    return {
+        "url": export_url,
+        "remove_comments": comment_checkbox.isChecked(),
+        "remove_scripts": script_checkbox.isChecked(),
+        "remove_styles": style_checkbox.isChecked(),
+        "remove_stylesheets": stylesheet_checkbox.isChecked(),
+        "remove_noscript": noscript_checkbox.isChecked(),
+    }
+
+
 def show_file_update_dialog(
     parent: QWidget,
     current_rows: list[dict[str, str]],
@@ -113,7 +180,17 @@ def show_file_update_dialog(
     table.horizontalHeader().setSectionResizeMode(0, table.horizontalHeader().ResizeMode.Stretch)
     table.horizontalHeader().setSectionResizeMode(1, table.horizontalHeader().ResizeMode.ResizeToContents)
     table.horizontalHeader().setSectionResizeMode(2, table.horizontalHeader().ResizeMode.ResizeToContents)
+    table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+    table.setCurrentCell(0, 0)
     layout.addWidget(table)
+
+    progress_status = QLabel("等待开始更新")
+    layout.addWidget(progress_status)
+
+    progress_bar = QProgressBar()
+    progress_bar.setRange(0, 1)
+    progress_bar.setValue(0)
+    layout.addWidget(progress_bar)
 
     source_rows = [
         {"url": row.get("url", "").strip(), "params": row.get("params", "").strip()}
@@ -124,6 +201,15 @@ def show_file_update_dialog(
         entry_url: normalize_child_rules(items)
         for entry_url, items in current_rules.items()
     }
+
+    def update_fetch_progress(current: int, total: int, message: str) -> None:
+        progress_status.setText(message)
+        if total <= 0:
+            progress_bar.setRange(0, 0)
+        else:
+            progress_bar.setRange(0, total)
+            progress_bar.setValue(max(0, min(current, total)))
+        QApplication.processEvents()
 
     def fetch_row_html(row_index: int) -> None:
         if row_index >= len(working_rows):
@@ -136,40 +222,85 @@ def show_file_update_dialog(
 
         working_rows[row_index]["url"] = url_text
         full_url = build_url_with_params(url_text, working_rows[row_index].get("params", ""))
+        update_fetch_progress(0, 0, f"正在请求入口页: {full_url}")
 
         try:
             html_text = fetch_html(full_url)
         except Exception as exc:
+            progress_bar.setRange(0, 1)
+            progress_bar.setValue(0)
+            progress_status.setText("入口页获取失败")
             QMessageBox.warning(dialog, "提示", f"获取 HTML 失败: {exc}")
             return
 
-        cleaned_html = clean_html_for_output(html_text)
         matched_results = parse_links_by_rules(
-            cleaned_html,
+            html_text,
             full_url,
             working_rules.get(url_text, []),
+            progress_callback=update_fetch_progress,
         )
 
-        print(f"\n===== HTML START: {full_url} =====")
-        print(cleaned_html)
-        print(f"===== HTML END: {full_url} =====\n")
-
-        if not matched_results:
-            print(f"===== PARSED LINKS: {full_url} =====")
-            print("No matched rules or no links extracted.")
-            print(f"===== PARSED LINKS END: {full_url} =====\n")
-            return
+        parsed_links: list[str] = []
+        seen_links: set[str] = set()
+        total_pages = 0
+        for result in matched_results:
+            page_count = parse_int_value(result.get("page_count"), 0)
+            if page_count > total_pages:
+                total_pages = page_count
+            for link in result.get("links", []):
+                if not isinstance(link, str) or link in seen_links:
+                    continue
+                seen_links.add(link)
+                parsed_links.append(link)
 
         print(f"===== PARSED LINKS: {full_url} =====")
-        for result in matched_results:
-            print(f"[{result['site_name']}]")
-            print(f"match_url={result['match_url'] or '(empty)'}")
-            if result["links"]:
-                for link in result["links"]:
-                    print(link)
-            else:
-                print("No links extracted.")
+        print(json.dumps(parsed_links, ensure_ascii=False, indent=2))
+        print(f"总页数: {total_pages}")
+        print(f"总链接数: {len(parsed_links)}")
         print(f"===== PARSED LINKS END: {full_url} =====\n")
+        progress_bar.setRange(0, max(1, total_pages))
+        progress_bar.setValue(max(1, total_pages))
+        progress_status.setText(f"抓取完成，共 {total_pages} 页，{len(parsed_links)} 个链接")
+
+    def export_row_html() -> None:
+        filter_options = show_html_filter_dialog(dialog)
+        if filter_options is None:
+            return
+
+        full_url = str(filter_options.get("url", "")).strip()
+        if not full_url:
+            QMessageBox.warning(dialog, "提示", "请先输入目标网址。")
+            return
+
+        suggested_name = build_default_export_filename(full_url)
+        save_path, _ = QFileDialog.getSaveFileName(
+            dialog,
+            "保存 HTML 文本",
+            suggested_name,
+            "Text Files (*.txt);;All Files (*)",
+        )
+        if not save_path:
+            return
+
+        progress_status.setText(f"正在获取并导出 HTML: {full_url}")
+        progress_bar.setRange(0, 0)
+        QApplication.processEvents()
+
+        try:
+            html_text = fetch_html(full_url)
+            filtered_html = clean_html_for_output(html_text, filter_options)
+            Path(save_path).write_text(filtered_html, encoding="utf-8")
+        except Exception as exc:
+            progress_bar.setRange(0, 1)
+            progress_bar.setValue(0)
+            progress_status.setText("HTML 导出失败")
+            QMessageBox.warning(dialog, "提示", f"导出 HTML 失败: {exc}")
+            return
+
+        progress_bar.setRange(0, 1)
+        progress_bar.setValue(1)
+        progress_status.setText(f"HTML 已导出到: {save_path}")
+        QMessageBox.information(dialog, "完成", f"HTML 已保存到:\n{save_path}")
 
     def edit_row_params(row_index: int) -> None:
         if row_index >= len(working_rows):
@@ -199,6 +330,7 @@ def show_file_update_dialog(
         update_button = QPushButton("更新")
         update_button.clicked.connect(lambda _=False, row=row_index: fetch_row_html(row))
         table.setCellWidget(row_index, 2, update_button)
+
         table.setRowHeight(row_index, 38)
 
     for row in source_rows:
@@ -209,10 +341,12 @@ def show_file_update_dialog(
     button_row = QHBoxLayout()
     add_button = QPushButton("添加")
     rules_button = QPushButton("规则")
+    export_html_button = QPushButton("导出HTML")
     save_button = QPushButton("保存")
     close_button = QPushButton("关闭")
     button_row.addWidget(add_button)
     button_row.addWidget(rules_button)
+    button_row.addWidget(export_html_button)
     button_row.addStretch()
     button_row.addWidget(save_button)
     button_row.addWidget(close_button)
@@ -222,6 +356,7 @@ def show_file_update_dialog(
     rules_button.clicked.connect(
         lambda: open_site_rules_dialog(dialog, table, working_rows, working_rules)
     )
+    export_html_button.clicked.connect(export_row_html)
     save_button.clicked.connect(dialog.accept)
     close_button.clicked.connect(dialog.reject)
 
@@ -417,7 +552,7 @@ def show_rule_json_dialog(
     site_name_input = QLineEdit(current_name)
     site_name_input.setPlaceholderText("例如 搜索结果页")
     match_url_input = QLineEdit(current_match_url)
-    match_url_input.setPlaceholderText("可留空，或填写 URL 关键字用于匹配当前页面")
+    match_url_input.setPlaceholderText("可留空，支持普通文本、* 通配符、regex:正则")
     form_layout.addRow("子网站名称", site_name_input)
     form_layout.addRow("URL 匹配", match_url_input)
     layout.addLayout(form_layout)
@@ -478,14 +613,35 @@ def show_rule_json_dialog(
         "  适合 target 本身就是 a、img 这类目标标签的情况。\n\n"
         "match_url\n"
         "  这不是 JSON 内字段，而是上方单独填写的 URL 匹配条件。\n"
-        "  当当前页面 URL 包含这段文字时，才会使用这条规则。\n"
-        "  可以留空，表示不限制。\n\n"
+        "  支持三种写法:\n"
+        "  1. 普通文本: 当前页面 URL 包含这段文字时命中。\n"
+        "  2. 通配符: 使用 * 匹配任意长度字符，例如 www.sample.com/page/*/?s=*。\n"
+        "  3. 正则: 以 regex: 开头，例如 regex:^www\\.sample\\.com/page/\\d+/\\?s=[^&]+$。\n"
+        "  可以留空，表示通用规则。\n"
+        "  当多条特定规则同时命中时，会优先执行更具体的那条规则。\n\n"
+        "pagination_enabled\n"
+        "  可选。true 时启用自动翻页抓取。\n\n"
+        "page_url_template\n"
+        "  启用分页时必填，使用 {page} 作为页码占位。\n"
+        "  例如 https://example.com/page/{page}/?\n\n"
+        "start_page\n"
+        "  可选。起始页码，默认 1。\n\n"
+        "page_number_selector\n"
+        "  启用分页时必填。分页栏页码节点的 CSS 选择器。\n\n"
+        "page_number_attr\n"
+        "  可选。默认 text，也可以填 href。\n\n"
+        "page_number_regex\n"
+        "  可选。默认 \\\\d+，用于从分页节点内容里提取页码。\n\n"
+        "max_page_limit\n"
+        "  可选。默认 200，防止循环抓取过多页。\n\n"
         "常见组合:\n"
         "1. 提取列表里的详情页链接\n"
         '   {"step":1,"next_step":2,"target":"article.item-list","link_selector":"h2.post-box-title a","attr":"href"}\n\n'
         "2. target 本身就是链接\n"
         '   {"step":1,"target":"a.download-link","attr":"href","use_target_directly":true}\n\n'
-        "3. 提取标题文字\n"
+        "3. 自动翻页提取链接\n"
+        '   {"step":1,"target":"article.item-list","link_selector":"h2.post-box-title a","attr":"href","pagination_enabled":true,"page_url_template":"https://example.com/page/{page}/?","start_page":1,"page_number_selector":".pagination a, .pagination span","page_number_attr":"text","page_number_regex":"\\\\d+","max_page_limit":200}\n\n'
+        "4. 提取标题文字\n"
         '   {"step":1,"target":"article.item-list","link_selector":"h2.post-box-title a","attr":"text"}'
     )
     help_text.setMinimumHeight(260)
@@ -508,7 +664,7 @@ def show_rule_json_dialog(
     rule_json_text = json_input.toPlainText().strip()
     if rule_json_text:
         try:
-            parse_rule_text(rule_json_text)
+            validate_rule_config(parse_rule_text(rule_json_text))
         except ValueError as exc:
             QMessageBox.warning(parent, "提示", f"规则格式无效: {exc}")
             return None
@@ -594,17 +750,42 @@ def fetch_html(url: str) -> str:
             return raw_data.decode("utf-8", errors="replace")
 
 
-def clean_html_for_output(html_text: str) -> str:
-    cleaned = re.sub(r"<!--.*?-->", "", html_text, flags=re.DOTALL)
-    cleaned = re.sub(r"<script\b[^>]*>.*?</script>", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
-    cleaned = re.sub(r"<style\b[^>]*>.*?</style>", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
-    cleaned = re.sub(
-        r"<link\b[^>]*rel=[\"']?stylesheet[\"']?[^>]*>",
-        "",
-        cleaned,
-        flags=re.IGNORECASE,
-    )
-    cleaned = re.sub(r"<noscript\b[^>]*>.*?</noscript>", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
+def build_default_export_filename(url_text: str) -> str:
+    parts = urlsplit(url_text)
+    host = parts.netloc or "page"
+    path_text = parts.path.strip("/").replace("/", "_")
+    file_stem = f"{host}_{path_text}" if path_text else host
+    safe_name = re.sub(r'[\\/:*?"<>|]+', "_", file_stem).strip("._") or "page"
+    return f"{safe_name}.txt"
+
+
+def clean_html_for_output(
+    html_text: str,
+    filter_options: dict[str, bool] | None = None,
+) -> str:
+    options = filter_options or {
+        "remove_comments": True,
+        "remove_scripts": True,
+        "remove_styles": True,
+        "remove_stylesheets": True,
+        "remove_noscript": True,
+    }
+    cleaned = html_text
+    if options.get("remove_comments", False):
+        cleaned = re.sub(r"<!--.*?-->", "", cleaned, flags=re.DOTALL)
+    if options.get("remove_scripts", False):
+        cleaned = re.sub(r"<script\b[^>]*>.*?</script>", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if options.get("remove_styles", False):
+        cleaned = re.sub(r"<style\b[^>]*>.*?</style>", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if options.get("remove_stylesheets", False):
+        cleaned = re.sub(
+            r"<link\b[^>]*rel=[\"']?stylesheet[\"']?[^>]*>",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+    if options.get("remove_noscript", False):
+        cleaned = re.sub(r"<noscript\b[^>]*>.*?</noscript>", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
     cleaned = re.sub(r"\n\s*\n+", "\n\n", cleaned)
     return cleaned.strip()
 
@@ -613,14 +794,34 @@ def parse_links_by_rules(
     html_text: str,
     page_url: str,
     child_rules: list[dict[str, str]],
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> list[dict[str, object]]:
-    soup = BeautifulSoup(html_text, "html.parser")
     matched_results: list[dict[str, object]] = []
+    normalized_rules = normalize_child_rules(child_rules)
+    specific_matches: list[tuple[tuple[int, int, int], dict[str, str]]] = []
+    generic_rules: list[dict[str, str]] = []
 
-    for child_rule in normalize_child_rules(child_rules):
+    for child_rule in normalized_rules:
         match_url = child_rule.get("match_url", "")
-        if match_url and match_url not in page_url:
+        if match_url:
+            if rule_matches_page_url(match_url, page_url):
+                specific_matches.append((get_match_url_priority(match_url), child_rule))
             continue
+        generic_rules.append(child_rule)
+
+    if specific_matches:
+        best_priority = max(priority for priority, _ in specific_matches)
+        active_rules = [
+            child_rule
+            for priority, child_rule in specific_matches
+            if priority == best_priority
+        ]
+    else:
+        active_rules = generic_rules
+    total_rules = len(active_rules)
+
+    for rule_index, child_rule in enumerate(active_rules, start=1):
+        match_url = child_rule.get("match_url", "")
 
         rule_text = child_rule.get("rule_json", "")
         if not rule_text:
@@ -631,16 +832,83 @@ def parse_links_by_rules(
         except ValueError:
             continue
 
-        links = extract_links_from_rule(soup, page_url, rule)
+        site_name = child_rule.get("site_name", "") or "未命名子网站"
+
+        def report_rule_progress(current: int, total: int, message: str) -> None:
+            if progress_callback is None:
+                return
+            progress_callback(
+                current,
+                total,
+                f"规则 {rule_index}/{total_rules} - {site_name} - {message}",
+            )
+
+        try:
+            collection_result = collect_links_from_rule_across_pages(
+                html_text,
+                page_url,
+                rule,
+                progress_callback=report_rule_progress,
+            )
+        except ValueError:
+            continue
         matched_results.append(
             {
-                "site_name": child_rule.get("site_name", "") or "未命名子网站",
+                "site_name": site_name,
                 "match_url": match_url,
-                "links": links,
+                "links": collection_result["links"],
+                "page_count": collection_result["page_count"],
             }
         )
 
     return matched_results
+
+
+def rule_matches_page_url(match_url: str, page_url: str) -> bool:
+    candidates = build_match_url_candidates(page_url)
+    if match_url.startswith("regex:"):
+        pattern_text = match_url[6:].strip()
+        if not pattern_text:
+            return False
+        try:
+            pattern = re.compile(pattern_text)
+        except re.error:
+            return False
+        return any(pattern.search(candidate) for candidate in candidates)
+
+    if "*" in match_url:
+        pattern = re.compile(wildcard_match_url_to_regex(match_url))
+        return any(pattern.fullmatch(candidate) for candidate in candidates)
+
+    return any(match_url in candidate for candidate in candidates)
+
+
+def build_match_url_candidates(page_url: str) -> list[str]:
+    normalized_page_url = page_url.strip()
+    no_scheme_page_url = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", "", normalized_page_url)
+    candidates = [normalized_page_url]
+    if no_scheme_page_url != normalized_page_url:
+        candidates.append(no_scheme_page_url)
+    return candidates
+
+
+def wildcard_match_url_to_regex(match_url: str) -> str:
+    escaped = re.escape(match_url)
+    return "^" + escaped.replace(r"\*", ".*") + "$"
+
+
+def get_match_url_priority(match_url: str) -> tuple[int, int, int]:
+    if match_url.startswith("regex:"):
+        pattern_text = match_url[6:].strip()
+        regex_meta_chars = sum(1 for char in pattern_text if char in ".^$+?{}[]|()\\")
+        return (3, len(pattern_text) - regex_meta_chars, -regex_meta_chars)
+
+    wildcard_count = match_url.count("*")
+    if wildcard_count > 0:
+        literal_length = len(match_url.replace("*", ""))
+        return (2, literal_length, -wildcard_count)
+
+    return (1, len(match_url), 0)
 
 
 def parse_rule_text(rule_text: str) -> dict[str, object]:
@@ -652,6 +920,55 @@ def parse_rule_text(rule_text: str) -> dict[str, object]:
     if not isinstance(parsed, dict):
         raise ValueError("规则内容必须是一个对象。")
     return parsed
+
+
+def validate_rule_config(rule: dict[str, object]) -> None:
+    pagination_config = get_pagination_config(rule)
+    if not pagination_config["enabled"]:
+        return
+
+    page_url_template = str(pagination_config["page_url_template"])
+    if not page_url_template or "{page}" not in page_url_template:
+        raise ValueError("启用自动翻页时，page_url_template 必须包含 {page} 占位。")
+
+    page_number_selector = str(pagination_config["page_number_selector"])
+    if not page_number_selector:
+        raise ValueError("启用自动翻页时，page_number_selector 不能为空。")
+
+    try:
+        re.compile(str(pagination_config["page_number_regex"]))
+    except re.error as exc:
+        raise ValueError(f"page_number_regex 无效: {exc}") from exc
+
+    start_page = int(pagination_config["start_page"])
+    max_page_limit = int(pagination_config["max_page_limit"])
+    if start_page < 1:
+        raise ValueError("start_page 不能小于 1。")
+    if max_page_limit < start_page:
+        raise ValueError("max_page_limit 不能小于 start_page。")
+
+
+def get_pagination_config(rule: dict[str, object]) -> dict[str, object]:
+    return {
+        "enabled": bool(rule.get("pagination_enabled", False)),
+        "page_url_template": str(rule.get("page_url_template", "")).strip(),
+        "start_page": max(1, parse_int_value(rule.get("start_page"), 1)),
+        "page_number_selector": str(rule.get("page_number_selector", "")).strip(),
+        "page_number_attr": str(rule.get("page_number_attr", "text")).strip() or "text",
+        "page_number_regex": str(rule.get("page_number_regex", r"\d+")).strip() or r"\d+",
+        "max_page_limit": max(1, parse_int_value(rule.get("max_page_limit"), 200)),
+    }
+
+
+def parse_int_value(value: object, default: int) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
 
 
 def parse_relaxed_rule_text(rule_text: str) -> dict[str, object]:
@@ -735,6 +1052,126 @@ def parse_relaxed_value(value_text: str) -> object:
         return float(value_text)
 
     return value_text
+
+
+def collect_links_from_rule_across_pages(
+    initial_html_text: str,
+    initial_page_url: str,
+    rule: dict[str, object],
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> dict[str, object]:
+    validate_rule_config(rule)
+    pagination_config = get_pagination_config(rule)
+    if not pagination_config["enabled"]:
+        soup = BeautifulSoup(initial_html_text, "html.parser")
+        links = extract_links_from_rule(soup, initial_page_url, rule)
+        if progress_callback is not None:
+            progress_callback(1, 1, "当前规则无需翻页")
+        return {"links": links, "page_count": 1}
+
+    start_page = int(pagination_config["start_page"])
+    max_page_limit = int(pagination_config["max_page_limit"])
+    pending_pages: list[int] = [start_page]
+    queued_pages: set[int] = {start_page}
+    visited_pages: set[int] = set()
+    known_max_page = start_page
+    all_links: list[str] = []
+    seen_links: set[str] = set()
+
+    while pending_pages:
+        page_number = pending_pages.pop(0)
+        queued_pages.discard(page_number)
+        if page_number in visited_pages or page_number > max_page_limit:
+            continue
+
+        if page_number == start_page:
+            page_url = initial_page_url
+            html_text = initial_html_text
+        else:
+            page_url = build_page_url(
+                str(pagination_config["page_url_template"]),
+                page_number,
+                initial_page_url,
+            )
+            try:
+                html_text = fetch_html(page_url)
+            except Exception:
+                continue
+
+        visited_pages.add(page_number)
+        soup = BeautifulSoup(html_text, "html.parser")
+        page_links = extract_links_from_rule(soup, page_url, rule)
+        for link in page_links:
+            if link in seen_links:
+                continue
+            seen_links.add(link)
+            all_links.append(link)
+
+        visible_max_page = extract_visible_max_page(soup, pagination_config)
+        if visible_max_page is None:
+            if progress_callback is not None:
+                progress_callback(
+                    len(visited_pages),
+                    max(len(visited_pages), known_max_page),
+                    f"已抓取第 {page_number} 页",
+                )
+            continue
+
+        print(f"[PAGINATION] page={page_number}, visible_max_page={visible_max_page}")
+
+        capped_max_page = min(visible_max_page, max_page_limit)
+        if progress_callback is not None:
+            progress_callback(
+                len(visited_pages),
+                max(len(visited_pages), capped_max_page),
+                f"已抓取第 {page_number} 页，共 {capped_max_page} 页",
+            )
+        if capped_max_page <= known_max_page:
+            continue
+
+        for next_page in range(known_max_page + 1, capped_max_page + 1):
+            if next_page in visited_pages or next_page in queued_pages:
+                continue
+            pending_pages.append(next_page)
+            queued_pages.add(next_page)
+        known_max_page = capped_max_page
+
+    print(f"[PAGINATION] final_max_page={known_max_page}")
+    if progress_callback is not None:
+        progress_callback(len(visited_pages), len(visited_pages), "当前规则抓取完成")
+    return {"links": all_links, "page_count": len(visited_pages)}
+
+
+def build_page_url(page_url_template: str, page_number: int, current_page_url: str) -> str:
+    if "{page}" not in page_url_template:
+        raise ValueError("page_url_template 必须包含 {page} 占位。")
+    return urljoin(current_page_url, page_url_template.format(page=page_number))
+
+
+def extract_visible_max_page(soup: BeautifulSoup, pagination_config: dict[str, object]) -> int | None:
+    page_number_selector = str(pagination_config["page_number_selector"])
+    if not page_number_selector:
+        return None
+
+    page_number_attr = str(pagination_config["page_number_attr"])
+    page_number_regex = str(pagination_config["page_number_regex"])
+    try:
+        pattern = re.compile(page_number_regex)
+    except re.error:
+        pattern = re.compile(r"\d+")
+
+    max_page: int | None = None
+    for node in soup.select(page_number_selector):
+        raw_value = extract_rule_value(node, page_number_attr)
+        if not raw_value:
+            continue
+        for match in pattern.findall(raw_value):
+            page_number = parse_int_value(match, 0)
+            if page_number < 1:
+                continue
+            if max_page is None or page_number > max_page:
+                max_page = page_number
+    return max_page
 
 
 def extract_links_from_rule(soup: BeautifulSoup, page_url: str, rule: dict[str, object]) -> list[str]:

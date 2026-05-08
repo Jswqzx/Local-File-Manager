@@ -1,9 +1,10 @@
 {
   "https://misskon.com/page/1/?": [
     {
-      "site_name": "www.sample.com",
-      "match_url": "",
-      "rule_json": "{\n  \"step\": 1,\n  \"target\": \"article.item-list\",\n  \"link_selector\": \"a\",\n  \"attr\": \"href\"\n}"
+      "site_name": "misskon.com",
+      "match_url": "https://misskon.com/page/",
+      "rule_json": "{\n  \"step\": 1,\n  \"target\": \"article.item-list\",\n  \"link_selector\": \"h2.post-box-title a\",\n  \"attr\": \"href\",\n  \"pagination_enabled\":true,\n  \"page_url_template\":\"https://misskon.com/page/{page}/?s=%E8%A0%A2%E6%B2%AB%E6%B2%AB\",\n  \"start_page\":1,\n  \"page_number_selector\":\".pagination a, .page\",\n  \"page_number_attr\":\"text\",\n  \"page_number_regex\":\"\\\\d+\",\n  \"max_page_limit\":200\n}"
     }
-  ]
+  ],
+  "https://www.baidu.com/s?": []
 }
