@@ -46,7 +46,7 @@ def save_file_update_rows(rows: list[dict[str, str]]) -> None:
     )
 
 
-def load_site_rules() -> dict[str, list[dict[str, str]]]:
+def load_site_rules() -> dict[str, list[dict[str, object]]]:
     if not RULES_FILE.exists():
         return {}
 
@@ -58,43 +58,42 @@ def load_site_rules() -> dict[str, list[dict[str, str]]]:
     if not isinstance(data, dict):
         return {}
 
-    rules: dict[str, list[dict[str, str]]] = {}
+    rules: dict[str, list[dict[str, object]]] = {}
     for site_url, items in data.items():
         if not isinstance(site_url, str) or not isinstance(items, list):
             continue
-        normalized_items: list[dict[str, str]] = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            normalized_items.append(
-                {
-                    "site_name": str(item.get("site_name", "")).strip(),
-                    "match_url": str(item.get("match_url", "")).strip(),
-                    "rule_json": str(item.get("rule_json", "")).strip(),
-                }
-            )
+        normalized_items = _normalize_rule_items(items)
         rules[site_url.strip()] = normalized_items
     return rules
 
 
-def save_site_rules(rules: dict[str, list[dict[str, str]]]) -> None:
-    normalized_rules: dict[str, list[dict[str, str]]] = {}
+def save_site_rules(rules: dict[str, list[dict[str, object]]]) -> None:
+    normalized_rules: dict[str, list[dict[str, object]]] = {}
     for site_url, items in rules.items():
         cleaned_url = str(site_url).strip()
         if not cleaned_url:
             continue
-        normalized_items: list[dict[str, str]] = []
-        for item in items:
-            normalized_items.append(
-                {
-                    "site_name": str(item.get("site_name", "")).strip(),
-                    "match_url": str(item.get("match_url", "")).strip(),
-                    "rule_json": str(item.get("rule_json", "")).strip(),
-                }
-            )
+        normalized_items = _normalize_rule_items(items)
         normalized_rules[cleaned_url] = normalized_items
 
     RULES_FILE.write_text(
         json.dumps(normalized_rules, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def _normalize_rule_items(items: list[dict[str, object]]) -> list[dict[str, object]]:
+    normalized_items: list[dict[str, object]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        children = item.get("children", [])
+        normalized_items.append(
+            {
+                "site_name": str(item.get("site_name", "")).strip(),
+                "match_url": str(item.get("match_url", "")).strip(),
+                "rule_json": str(item.get("rule_json", "")).strip(),
+                "children": _normalize_rule_items(children) if isinstance(children, list) else [],
+            }
+        )
+    return normalized_items

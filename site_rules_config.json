@@ -1,9 +1,17 @@
 {
   "https://misskon.com/page/1/?": [
     {
-      "site_name": "misskon.com",
-      "match_url": "https://misskon.com/page/",
-      "rule_json": "{\n  \"step\": 1,\n  \"target\": \"article.item-list\",\n  \"link_selector\": \"h2.post-box-title a\",\n  \"attr\": \"href\",\n  \"pagination_enabled\":true,\n  \"page_url_template\":\"https://misskon.com/page/{page}/?s=%E8%A0%A2%E6%B2%AB%E6%B2%AB\",\n  \"start_page\":1,\n  \"page_number_selector\":\".pagination a, .page\",\n  \"page_number_attr\":\"text\",\n  \"page_number_regex\":\"\\\\d+\",\n  \"max_page_limit\":200\n}"
+      "site_name": "source_index",
+      "match_url": "regex:^https:\\/\\/misskon\\.com/page/[0-9]*/\\?s=[\\w%]+",
+      "rule_json": "{\n  \"step\": 1,\n  \"fetch_mode\": \"background\",\n  \"target\": \"article.item-list\",\n  \"link_selector\": \"h2.post-box-title a\",\n  \"attr\": \"href\",\n  \"pagination_enabled\":true,\n  \"page_url_template\":\"https://misskon.com/page/{page}/?s=%E8%A0%A2%E6%B2%AB%E6%B2%AB\",\n  \"start_page\":1,\n  \"page_number_selector\":\".pagination a, .page\",\n  \"page_number_attr\":\"text\",\n  \"page_number_regex\":\"\\\\d+\",\n  \"max_page_limit\":200\n}",
+      "children": [
+        {
+          "site_name": "source_detail",
+          "match_url": "regex:^https:\\/\\/misskon\\.com/[\\w-]+",
+          "rule_json": "{\n  \"step\": 1,\n  \"fetch_mode\": \"background\",\n  \"target\": \"p a.shortc-button medium green\",\n  \"link_selector\": \"a\",\n  \"attr\": \"href\"\n}",
+          "children": []
+        }
+      ]
     }
   ],
   "https://www.baidu.com/s?": []

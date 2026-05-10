@@ -244,10 +244,8 @@ def show_file_update_dialog(
         seen_links: set[str] = set()
         total_pages = 0
         for result in matched_results:
-            page_count = parse_int_value(result.get("page_count"), 0)
-            if page_count > total_pages:
-                total_pages = page_count
-            for link in result.get("links", []):
+            total_pages += count_result_pages(result)
+            for link in flatten_result_links(result):
                 if not isinstance(link, str) or link in seen_links:
                     continue
                 seen_links.add(link)
@@ -407,7 +405,7 @@ def show_site_rules_dialog(
     layout.setContentsMargins(12, 12, 12, 12)
     layout.setSpacing(8)
 
-    tip_label = QLabel("先按入口网站展开，再为该入口网站添加子网站规则。子网站配置用 JSON 描述解析逻辑。")
+    tip_label = QLabel("先按入口网站展开。选中任意网址节点后，可在该节点下添加直属子网站规则。抓取时只会按当前节点匹配下一级，再继续向下处理。")
     tip_label.setWordWrap(True)
     layout.addWidget(tip_label)
 
@@ -422,6 +420,25 @@ def show_site_rules_dialog(
         for entry_url in entry_urls
     }
 
+    def build_rule_item(
+        parent_item: QTreeWidgetItem,
+        node_rule: dict[str, object],
+        path: tuple[int, ...],
+    ) -> None:
+        child_name = str(node_rule.get("site_name", "")).strip() or f"子网站 {path[-1] + 1}"
+        child_item = QTreeWidgetItem([child_name, str(node_rule.get("match_url", "")).strip(), ""])
+        child_item.setData(0, Qt.ItemDataRole.UserRole, ("child", path))
+        parent_item.addChild(child_item)
+
+        config_button = QPushButton("配置")
+        config_button.clicked.connect(
+            lambda _=False, item=child_item: configure_child_rule(item)
+        )
+        rules_tree.setItemWidget(child_item, 2, config_button)
+
+        for child_index, nested_rule in enumerate(get_child_rule_children(node_rule)):
+            build_rule_item(child_item, nested_rule, path + (child_index,))
+
     def rebuild_tree() -> None:
         rules_tree.clear()
         for entry_url in entry_urls:
@@ -431,16 +448,7 @@ def show_site_rules_dialog(
             entry_item.setExpanded(True)
 
             for index, child_rule in enumerate(working_rules.get(entry_url, [])):
-                child_name = child_rule.get("site_name", "") or f"子网站 {index + 1}"
-                child_item = QTreeWidgetItem([child_name, child_rule.get("match_url", ""), ""])
-                child_item.setData(0, Qt.ItemDataRole.UserRole, ("child", entry_url, index))
-                entry_item.addChild(child_item)
-
-                config_button = QPushButton("配置")
-                config_button.clicked.connect(
-                    lambda _=False, item=child_item: configure_child_rule(item)
-                )
-                rules_tree.setItemWidget(child_item, 2, config_button)
+                build_rule_item(entry_item, child_rule, (index,))
 
         rules_tree.expandAll()
         rules_tree.resizeColumnToContents(0)
@@ -451,9 +459,19 @@ def show_site_rules_dialog(
         if not data or data[0] != "child":
             return
 
-        entry_url = data[1]
-        rule_index = data[2]
-        child_rule = working_rules[entry_url][rule_index]
+        parent_item = child_item.parent()
+        if parent_item is None:
+            return
+        entry_data = parent_item
+        while entry_data.parent() is not None:
+            entry_data = entry_data.parent()
+        top_level_data = entry_data.data(0, Qt.ItemDataRole.UserRole)
+        if not top_level_data or top_level_data[0] != "entry":
+            return
+
+        entry_url = top_level_data[1]
+        path = data[1]
+        child_rule = get_rule_by_path(working_rules.get(entry_url, []), path)
         result = show_rule_json_dialog(
             dialog,
             child_rule.get("site_name", ""),
@@ -472,23 +490,39 @@ def show_site_rules_dialog(
     def add_child_site() -> None:
         current_item = rules_tree.currentItem()
         if current_item is None:
-            QMessageBox.warning(dialog, "提示", "请先选择一个入口网站。")
+            QMessageBox.warning(dialog, "提示", "请先选择一个网址节点。")
             return
 
         data = current_item.data(0, Qt.ItemDataRole.UserRole)
         if not data:
             return
 
-        entry_url = data[1]
+        if data[0] == "entry":
+            entry_url = data[1]
+            target_children = working_rules.setdefault(entry_url, [])
+        elif data[0] == "child":
+            top_level_item = current_item
+            while top_level_item.parent() is not None:
+                top_level_item = top_level_item.parent()
+            top_level_data = top_level_item.data(0, Qt.ItemDataRole.UserRole)
+            if not top_level_data or top_level_data[0] != "entry":
+                return
+            entry_url = top_level_data[1]
+            parent_rule = get_rule_by_path(working_rules.get(entry_url, []), data[1])
+            target_children = get_child_rule_children(parent_rule)
+        else:
+            return
+
         site_name, ok = QInputDialog.getText(dialog, "添加子网站", "子网站名称")
         if not ok:
             return
 
-        working_rules.setdefault(entry_url, []).append(
+        target_children.append(
             {
-                "site_name": site_name.strip() or f"子网站 {len(working_rules.get(entry_url, [])) + 1}",
+                "site_name": site_name.strip() or f"子网站 {len(target_children) + 1}",
                 "match_url": "",
-                "rule_json": '{\n  "step": 1,\n  "target": "article.item-list",\n  "link_selector": "a",\n  "attr": "href"\n}',
+                "rule_json": '{\n  "step": 1,\n  "fetch_mode": "background",\n  "target": "article.item-list",\n  "link_selector": "a",\n  "attr": "href"\n}',
+                "children": [],
             }
         )
         rebuild_tree()
@@ -504,9 +538,15 @@ def show_site_rules_dialog(
             QMessageBox.warning(dialog, "提示", "请先选择一个子网站。")
             return
 
-        entry_url = data[1]
-        rule_index = data[2]
-        del working_rules[entry_url][rule_index]
+        top_level_item = current_item
+        while top_level_item.parent() is not None:
+            top_level_item = top_level_item.parent()
+        top_level_data = top_level_item.data(0, Qt.ItemDataRole.UserRole)
+        if not top_level_data or top_level_data[0] != "entry":
+            return
+
+        entry_url = top_level_data[1]
+        remove_rule_by_path(working_rules.get(entry_url, []), data[1])
         rebuild_tree()
 
     button_row = QHBoxLayout()
@@ -561,6 +601,7 @@ def show_rule_json_dialog(
     json_input.setPlaceholderText(
         '{\n'
         '  "step": 1,\n'
+        '  "fetch_mode": "background",\n'
         '  "target": "article.item-list",\n'
         '  "link_selector": "h2.post-box-title a",\n'
         '  "attr": "href"\n'
@@ -578,15 +619,20 @@ def show_rule_json_dialog(
         "示例:\n"
         '{\n'
         '  "step": 1,\n'
+        '  "fetch_mode": "background",\n'
         '  "target": "article.item-list",\n'
         '  "link_selector": "h2.post-box-title a",\n'
         '  "attr": "href"\n'
         '}\n\n'
         "也支持简写:\n"
-        '{step:1,target:<article class="item-list">,link_selector:"a",attr:"href"}\n\n'
+        '{step:1,fetch_mode:"background",target:<article class="item-list">,link_selector:"a",attr:"href"}\n\n'
         "参数说明:\n"
         "step\n"
         "  当前步骤编号。当前版本主要用于标记步骤，后续可接多步流程。\n\n"
+        "fetch_mode\n"
+        "  可选。默认 background。\n"
+        "  background: 后台请求 HTML 后按规则提取。\n"
+        "  browser: 打开浏览器页面，按 browser_actions 模拟操作后再提取。\n\n"
         "next_step\n"
         "  可选。下一步步骤编号。\n"
         "  当前版本先保留这个字段，方便你按多步流程先写规则。\n"
@@ -611,6 +657,16 @@ def show_rule_json_dialog(
         "  false 时，会先找到 target，再在里面用 link_selector 找元素。\n"
         "  true 时，直接把 target 命中的元素本身作为取值对象。\n"
         "  适合 target 本身就是 a、img 这类目标标签的情况。\n\n"
+        "browser_actions\n"
+        "  仅在 fetch_mode=browser 时使用，可选。\n"
+        "  是一个数组，按顺序执行浏览器动作。\n"
+        "  支持 type: click、wait_for_selector、wait_for_load、sleep。\n"
+        "  click / wait_for_selector 需要 selector。\n"
+        "  sleep 使用 duration_ms。\n"
+        "  click 可选 wait_after_ms，点击后额外等待。\n\n"
+        "browser_headless\n"
+        "  可选。默认 false。\n"
+        "  false 会显示浏览器窗口，true 为无头模式。\n\n"
         "match_url\n"
         "  这不是 JSON 内字段，而是上方单独填写的 URL 匹配条件。\n"
         "  支持三种写法:\n"
@@ -635,14 +691,66 @@ def show_rule_json_dialog(
         "max_page_limit\n"
         "  可选。默认 200，防止循环抓取过多页。\n\n"
         "常见组合:\n"
-        "1. 提取列表里的详情页链接\n"
-        '   {"step":1,"next_step":2,"target":"article.item-list","link_selector":"h2.post-box-title a","attr":"href"}\n\n'
+        "1. 后台请求提取列表里的详情页链接\n"
+        '   {\n'
+        '     "step": 1,\n'
+        '     "fetch_mode": "background",\n'
+        '     "next_step": 2,\n'
+        '     "target": "article.item-list",\n'
+        '     "link_selector": "h2.post-box-title a",\n'
+        '     "attr": "href"\n'
+        '   }\n\n'
         "2. target 本身就是链接\n"
-        '   {"step":1,"target":"a.download-link","attr":"href","use_target_directly":true}\n\n'
+        '   {\n'
+        '     "step": 1,\n'
+        '     "fetch_mode": "background",\n'
+        '     "target": "a.download-link",\n'
+        '     "attr": "href",\n'
+        '     "use_target_directly": true\n'
+        '   }\n\n'
         "3. 自动翻页提取链接\n"
-        '   {"step":1,"target":"article.item-list","link_selector":"h2.post-box-title a","attr":"href","pagination_enabled":true,"page_url_template":"https://example.com/page/{page}/?","start_page":1,"page_number_selector":".pagination a, .pagination span","page_number_attr":"text","page_number_regex":"\\\\d+","max_page_limit":200}\n\n'
-        "4. 提取标题文字\n"
-        '   {"step":1,"target":"article.item-list","link_selector":"h2.post-box-title a","attr":"text"}'
+        '   {\n'
+        '     "step": 1,\n'
+        '     "fetch_mode": "background",\n'
+        '     "target": "article.item-list",\n'
+        '     "link_selector": "h2.post-box-title a",\n'
+        '     "attr": "href",\n'
+        '     "pagination_enabled": true,\n'
+        '     "page_url_template": "https://example.com/page/{page}/?",\n'
+        '     "start_page": 1,\n'
+        '     "page_number_selector": ".pagination a, .pagination span",\n'
+        '     "page_number_attr": "text",\n'
+        '     "page_number_regex": "\\\\d+",\n'
+        '     "max_page_limit": 200\n'
+        '   }\n\n'
+        "4. 打开浏览器点击后再提取链接\n"
+        '   {\n'
+        '     "step": 1,\n'
+        '     "fetch_mode": "browser",\n'
+        '     "browser_headless": false,\n'
+        '     "browser_actions": [\n'
+        '       {\n'
+        '         "type": "click",\n'
+        '         "selector": "button.load-more",\n'
+        '         "wait_after_ms": 1500\n'
+        '       },\n'
+        '       {\n'
+        '         "type": "wait_for_selector",\n'
+        '         "selector": "article.item-list"\n'
+        '       }\n'
+        '     ],\n'
+        '     "target": "article.item-list",\n'
+        '     "link_selector": "h2.post-box-title a",\n'
+        '     "attr": "href"\n'
+        '   }\n\n'
+        "5. 提取标题文字\n"
+        '   {\n'
+        '     "step": 1,\n'
+        '     "fetch_mode": "background",\n'
+        '     "target": "article.item-list",\n'
+        '     "link_selector": "h2.post-box-title a",\n'
+        '     "attr": "text"\n'
+        '   }'
     )
     help_text.setMinimumHeight(260)
     layout.addWidget(help_text)
@@ -676,17 +784,50 @@ def show_rule_json_dialog(
     )
 
 
-def normalize_child_rules(items: list[dict[str, str]]) -> list[dict[str, str]]:
-    normalized_items: list[dict[str, str]] = []
+def normalize_child_rules(items: list[dict[str, object]]) -> list[dict[str, object]]:
+    normalized_items: list[dict[str, object]] = []
     for item in items:
         normalized_items.append(
             {
                 "site_name": str(item.get("site_name", "")).strip(),
                 "match_url": str(item.get("match_url", "")).strip(),
                 "rule_json": str(item.get("rule_json", "")).strip(),
+                "children": normalize_child_rules(item.get("children", []))
+                if isinstance(item.get("children", []), list)
+                else [],
             }
         )
     return normalized_items
+
+
+def get_child_rule_children(rule_item: dict[str, object]) -> list[dict[str, object]]:
+    children = rule_item.get("children")
+    if isinstance(children, list):
+        return children
+    normalized_children: list[dict[str, object]] = []
+    rule_item["children"] = normalized_children
+    return normalized_children
+
+
+def get_rule_by_path(rule_items: list[dict[str, object]], path: tuple[int, ...]) -> dict[str, object]:
+    current_items = rule_items
+    current_rule: dict[str, object] | None = None
+    for index in path:
+        current_rule = current_items[index]
+        current_items = get_child_rule_children(current_rule)
+    if current_rule is None:
+        raise IndexError("规则路径无效。")
+    return current_rule
+
+
+def remove_rule_by_path(rule_items: list[dict[str, object]], path: tuple[int, ...]) -> None:
+    if not path:
+        return
+    if len(path) == 1:
+        del rule_items[path[0]]
+        return
+    parent_rule = get_rule_by_path(rule_items, path[:-1])
+    del get_child_rule_children(parent_rule)[path[-1]]
 
 
 def _get_row_url(table: QTableWidget, row_index: int) -> str:
@@ -793,13 +934,13 @@ def clean_html_for_output(
 def parse_links_by_rules(
     html_text: str,
     page_url: str,
-    child_rules: list[dict[str, str]],
+    child_rules: list[dict[str, object]],
     progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> list[dict[str, object]]:
     matched_results: list[dict[str, object]] = []
     normalized_rules = normalize_child_rules(child_rules)
-    specific_matches: list[tuple[tuple[int, int, int], dict[str, str]]] = []
-    generic_rules: list[dict[str, str]] = []
+    specific_matches: list[tuple[tuple[int, int, int], dict[str, object]]] = []
+    generic_rules: list[dict[str, object]] = []
 
     for child_rule in normalized_rules:
         match_url = child_rule.get("match_url", "")
@@ -844,12 +985,20 @@ def parse_links_by_rules(
             )
 
         try:
-            collection_result = collect_links_from_rule_across_pages(
-                html_text,
-                page_url,
-                rule,
-                progress_callback=report_rule_progress,
-            )
+            fetch_mode = get_fetch_mode(rule)
+            if fetch_mode == "browser":
+                collection_result = collect_links_from_browser_rule(
+                    page_url,
+                    rule,
+                    progress_callback=report_rule_progress,
+                )
+            else:
+                collection_result = collect_links_from_rule_across_pages(
+                    html_text,
+                    page_url,
+                    rule,
+                    progress_callback=report_rule_progress,
+                )
         except ValueError:
             continue
         matched_results.append(
@@ -858,10 +1007,84 @@ def parse_links_by_rules(
                 "match_url": match_url,
                 "links": collection_result["links"],
                 "page_count": collection_result["page_count"],
+                "children": collect_child_rule_results(
+                    collection_result["links"],
+                    get_child_rule_children(child_rule),
+                    site_name,
+                    page_url,
+                    parse_int_value(collection_result["page_count"], 0),
+                    progress_callback=report_rule_progress,
+                ),
             }
         )
 
     return matched_results
+
+
+def collect_child_rule_results(
+    parent_links: list[str],
+    child_rules: list[dict[str, object]],
+    parent_site_name: str,
+    parent_page_url: str,
+    parent_page_count: int,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> list[dict[str, object]]:
+    if not parent_links or not child_rules:
+        return []
+
+    print("===== CHILD MATCH INPUT START =====")
+    print(f"入口网站: {parent_site_name}")
+    print(f"页面地址: {parent_page_url}")
+    print(f"总页数: {parent_page_count}")
+    print("链接数组:")
+    print(json.dumps(parent_links, ensure_ascii=False, indent=2))
+    print("===== CHILD MATCH INPUT END =====\n")
+
+    child_results: list[dict[str, object]] = []
+    seen_page_urls: set[str] = set()
+    total_links = len(parent_links)
+
+    for link_index, link_url in enumerate(parent_links, start=1):
+        if link_url in seen_page_urls:
+            continue
+        seen_page_urls.add(link_url)
+
+        if progress_callback is not None:
+            progress_callback(link_index, total_links, f"正在匹配下一级: {link_url}")
+
+        try:
+            html_text = fetch_html(link_url)
+        except Exception:
+            continue
+
+        matched_results = parse_links_by_rules(
+            html_text,
+            link_url,
+            child_rules,
+            progress_callback=progress_callback,
+        )
+        child_results.extend(matched_results)
+
+    return child_results
+
+
+def flatten_result_links(result: dict[str, object]) -> list[str]:
+    flattened_links: list[str] = []
+    for link in result.get("links", []):
+        if isinstance(link, str):
+            flattened_links.append(link)
+    for child_result in result.get("children", []):
+        if isinstance(child_result, dict):
+            flattened_links.extend(flatten_result_links(child_result))
+    return flattened_links
+
+
+def count_result_pages(result: dict[str, object]) -> int:
+    total_pages = parse_int_value(result.get("page_count"), 0)
+    for child_result in result.get("children", []):
+        if isinstance(child_result, dict):
+            total_pages += count_result_pages(child_result)
+    return total_pages
 
 
 def rule_matches_page_url(match_url: str, page_url: str) -> bool:
@@ -923,6 +1146,15 @@ def parse_rule_text(rule_text: str) -> dict[str, object]:
 
 
 def validate_rule_config(rule: dict[str, object]) -> None:
+    fetch_mode = get_fetch_mode(rule)
+    if fetch_mode not in {"background", "browser"}:
+        raise ValueError('fetch_mode 只支持 "background" 或 "browser"。')
+
+    if fetch_mode == "browser":
+        validate_browser_actions(rule.get("browser_actions"))
+        if bool(rule.get("pagination_enabled", False)):
+            raise ValueError("fetch_mode=browser 暂不支持 pagination_enabled。")
+
     pagination_config = get_pagination_config(rule)
     if not pagination_config["enabled"]:
         return
@@ -946,6 +1178,29 @@ def validate_rule_config(rule: dict[str, object]) -> None:
         raise ValueError("start_page 不能小于 1。")
     if max_page_limit < start_page:
         raise ValueError("max_page_limit 不能小于 start_page。")
+
+
+def get_fetch_mode(rule: dict[str, object]) -> str:
+    return str(rule.get("fetch_mode", "background")).strip().lower() or "background"
+
+
+def validate_browser_actions(actions: object) -> None:
+    if actions in (None, ""):
+        return
+    if not isinstance(actions, list):
+        raise ValueError("browser_actions 必须是数组。")
+
+    supported_types = {"click", "wait_for_selector", "wait_for_load", "sleep"}
+    for index, action in enumerate(actions, start=1):
+        if not isinstance(action, dict):
+            raise ValueError(f"browser_actions 第 {index} 项必须是对象。")
+        action_type = str(action.get("type", "")).strip().lower()
+        if action_type not in supported_types:
+            raise ValueError(
+                f'browser_actions 第 {index} 项 type 只支持 {", ".join(sorted(supported_types))}。'
+            )
+        if action_type in {"click", "wait_for_selector"} and not str(action.get("selector", "")).strip():
+            raise ValueError(f"browser_actions 第 {index} 项缺少 selector。")
 
 
 def get_pagination_config(rule: dict[str, object]) -> dict[str, object]:
@@ -1054,6 +1309,88 @@ def parse_relaxed_value(value_text: str) -> object:
     return value_text
 
 
+def collect_links_from_browser_rule(
+    initial_page_url: str,
+    rule: dict[str, object],
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> dict[str, object]:
+    validate_rule_config(rule)
+
+    try:
+        from playwright.sync_api import Error as PlaywrightError
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise ValueError(
+            "browser 模式需要先安装 playwright：pip install playwright，然后执行 playwright install"
+        ) from exc
+
+    actions = rule.get("browser_actions")
+    action_list = actions if isinstance(actions, list) else []
+    headless = bool(rule.get("browser_headless", False))
+
+    if progress_callback is not None:
+        progress_callback(0, max(1, len(action_list) + 2), "正在启动浏览器")
+
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=headless)
+            page = browser.new_page()
+            page.goto(initial_page_url, wait_until="domcontentloaded", timeout=30000)
+
+            total_steps = max(1, len(action_list) + 2)
+            if progress_callback is not None:
+                progress_callback(1, total_steps, "页面已打开")
+
+            for index, action in enumerate(action_list, start=1):
+                run_browser_action(page, action)
+                if progress_callback is not None:
+                    action_type = str(action.get("type", "")).strip().lower() or "unknown"
+                    progress_callback(index + 1, total_steps, f"已执行浏览器动作: {action_type}")
+
+            html_text = page.content()
+            final_page_url = page.url
+            browser.close()
+    except PlaywrightError as exc:
+        raise ValueError(f"浏览器模式执行失败: {exc}") from exc
+
+    soup = BeautifulSoup(html_text, "html.parser")
+    links = extract_links_from_rule(soup, final_page_url, rule)
+    if progress_callback is not None:
+        progress_callback(total_steps, total_steps, "浏览器规则抓取完成")
+    return {"links": links, "page_count": 1}
+
+
+def run_browser_action(page: object, action: dict[str, object]) -> None:
+    action_type = str(action.get("type", "")).strip().lower()
+    timeout_ms = max(0, parse_int_value(action.get("timeout_ms"), 30000))
+
+    if action_type == "click":
+        selector = str(action.get("selector", "")).strip()
+        page.locator(selector).first.click(timeout=timeout_ms)
+        wait_after_ms = max(0, parse_int_value(action.get("wait_after_ms"), 0))
+        if wait_after_ms > 0:
+            page.wait_for_timeout(wait_after_ms)
+        return
+
+    if action_type == "wait_for_selector":
+        selector = str(action.get("selector", "")).strip()
+        state = str(action.get("state", "visible")).strip() or "visible"
+        page.wait_for_selector(selector, state=state, timeout=timeout_ms)
+        return
+
+    if action_type == "wait_for_load":
+        state = str(action.get("state", "networkidle")).strip() or "networkidle"
+        page.wait_for_load_state(state=state, timeout=timeout_ms)
+        return
+
+    if action_type == "sleep":
+        duration_ms = max(0, parse_int_value(action.get("duration_ms"), 1000))
+        page.wait_for_timeout(duration_ms)
+        return
+
+    raise ValueError(f"不支持的浏览器动作类型: {action_type}")
+
+
 def collect_links_from_rule_across_pages(
     initial_html_text: str,
     initial_page_url: str,
@@ -1117,8 +1454,6 @@ def collect_links_from_rule_across_pages(
                 )
             continue
 
-        print(f"[PAGINATION] page={page_number}, visible_max_page={visible_max_page}")
-
         capped_max_page = min(visible_max_page, max_page_limit)
         if progress_callback is not None:
             progress_callback(
@@ -1136,7 +1471,6 @@ def collect_links_from_rule_across_pages(
             queued_pages.add(next_page)
         known_max_page = capped_max_page
 
-    print(f"[PAGINATION] final_max_page={known_max_page}")
     if progress_callback is not None:
         progress_callback(len(visited_pages), len(visited_pages), "当前规则抓取完成")
     return {"links": all_links, "page_count": len(visited_pages)}
