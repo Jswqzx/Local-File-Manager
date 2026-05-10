@@ -251,11 +251,6 @@ def show_file_update_dialog(
                 seen_links.add(link)
                 parsed_links.append(link)
 
-        print(f"===== PARSED LINKS: {full_url} =====")
-        print(json.dumps(parsed_links, ensure_ascii=False, indent=2))
-        print(f"总页数: {total_pages}")
-        print(f"总链接数: {len(parsed_links)}")
-        print(f"===== PARSED LINKS END: {full_url} =====\n")
         progress_bar.setRange(0, max(1, total_pages))
         progress_bar.setValue(max(1, total_pages))
         progress_status.setText(f"抓取完成，共 {total_pages} 页，{len(parsed_links)} 个链接")
@@ -1001,18 +996,35 @@ def parse_links_by_rules(
                 )
         except ValueError:
             continue
+        collected_links = collection_result["links"]
+        collected_page_count = parse_int_value(collection_result["page_count"], 0)
+        html_tag_match_count = parse_int_value(collection_result.get("html_tag_match_count"), 0)
+        match_rule_text = str(match_url).strip() or "未设置"
+        match_status = (
+            "匹配成功"
+            if not match_url or rule_matches_page_url(str(match_url), page_url)
+            else "匹配失败"
+        )
+        formatted_links = "[\n" + "\n".join(collected_links) + "\n]" if collected_links else "[]"
+        print(f"入口网站：{page_url}")
+        print(f"子网中匹配规则：{match_rule_text} {match_status}")
+        print(f"HTML标签匹配成功数：{html_tag_match_count}")
+        print(f"页数：{collected_page_count}")
+        print(f"抓取链接总数：{len(collected_links)}")
+        print("抓取链接：")
+        print(formatted_links)
         matched_results.append(
             {
                 "site_name": site_name,
                 "match_url": match_url,
-                "links": collection_result["links"],
-                "page_count": collection_result["page_count"],
+                "links": collected_links,
+                "page_count": collected_page_count,
                 "children": collect_child_rule_results(
-                    collection_result["links"],
+                    collected_links,
                     get_child_rule_children(child_rule),
                     site_name,
                     page_url,
-                    parse_int_value(collection_result["page_count"], 0),
+                    collected_page_count,
                     progress_callback=report_rule_progress,
                 ),
             }
@@ -1031,14 +1043,6 @@ def collect_child_rule_results(
 ) -> list[dict[str, object]]:
     if not parent_links or not child_rules:
         return []
-
-    print("===== CHILD MATCH INPUT START =====")
-    print(f"入口网站: {parent_site_name}")
-    print(f"页面地址: {parent_page_url}")
-    print(f"总页数: {parent_page_count}")
-    print("链接数组:")
-    print(json.dumps(parent_links, ensure_ascii=False, indent=2))
-    print("===== CHILD MATCH INPUT END =====\n")
 
     child_results: list[dict[str, object]] = []
     seen_page_urls: set[str] = set()
@@ -1354,10 +1358,14 @@ def collect_links_from_browser_rule(
         raise ValueError(f"浏览器模式执行失败: {exc}") from exc
 
     soup = BeautifulSoup(html_text, "html.parser")
-    links = extract_links_from_rule(soup, final_page_url, rule)
+    extraction_result = extract_links_from_rule(soup, final_page_url, rule)
     if progress_callback is not None:
         progress_callback(total_steps, total_steps, "浏览器规则抓取完成")
-    return {"links": links, "page_count": 1}
+    return {
+        "links": extraction_result["links"],
+        "page_count": 1,
+        "html_tag_match_count": extraction_result["html_tag_match_count"],
+    }
 
 
 def run_browser_action(page: object, action: dict[str, object]) -> None:
@@ -1401,10 +1409,14 @@ def collect_links_from_rule_across_pages(
     pagination_config = get_pagination_config(rule)
     if not pagination_config["enabled"]:
         soup = BeautifulSoup(initial_html_text, "html.parser")
-        links = extract_links_from_rule(soup, initial_page_url, rule)
+        extraction_result = extract_links_from_rule(soup, initial_page_url, rule)
         if progress_callback is not None:
             progress_callback(1, 1, "当前规则无需翻页")
-        return {"links": links, "page_count": 1}
+        return {
+            "links": extraction_result["links"],
+            "page_count": 1,
+            "html_tag_match_count": extraction_result["html_tag_match_count"],
+        }
 
     start_page = int(pagination_config["start_page"])
     max_page_limit = int(pagination_config["max_page_limit"])
@@ -1414,6 +1426,7 @@ def collect_links_from_rule_across_pages(
     known_max_page = start_page
     all_links: list[str] = []
     seen_links: set[str] = set()
+    total_html_tag_match_count = 0
 
     while pending_pages:
         page_number = pending_pages.pop(0)
@@ -1437,8 +1450,12 @@ def collect_links_from_rule_across_pages(
 
         visited_pages.add(page_number)
         soup = BeautifulSoup(html_text, "html.parser")
-        page_links = extract_links_from_rule(soup, page_url, rule)
-        for link in page_links:
+        extraction_result = extract_links_from_rule(soup, page_url, rule)
+        total_html_tag_match_count += parse_int_value(
+            extraction_result["html_tag_match_count"],
+            0,
+        )
+        for link in extraction_result["links"]:
             if link in seen_links:
                 continue
             seen_links.add(link)
@@ -1473,7 +1490,11 @@ def collect_links_from_rule_across_pages(
 
     if progress_callback is not None:
         progress_callback(len(visited_pages), len(visited_pages), "当前规则抓取完成")
-    return {"links": all_links, "page_count": len(visited_pages)}
+    return {
+        "links": all_links,
+        "page_count": len(visited_pages),
+        "html_tag_match_count": total_html_tag_match_count,
+    }
 
 
 def build_page_url(page_url_template: str, page_number: int, current_page_url: str) -> str:
@@ -1508,10 +1529,10 @@ def extract_visible_max_page(soup: BeautifulSoup, pagination_config: dict[str, o
     return max_page
 
 
-def extract_links_from_rule(soup: BeautifulSoup, page_url: str, rule: dict[str, object]) -> list[str]:
+def extract_links_from_rule(soup: BeautifulSoup, page_url: str, rule: dict[str, object]) -> dict[str, object]:
     target_selector = normalize_target_selector(str(rule.get("target", "")).strip())
     if not target_selector:
-        return []
+        return {"links": [], "html_tag_match_count": 0}
 
     link_selector = str(rule.get("link_selector", "a")).strip() or "a"
     attr_name = str(rule.get("attr", "href")).strip() or "href"
@@ -1519,6 +1540,7 @@ def extract_links_from_rule(soup: BeautifulSoup, page_url: str, rule: dict[str, 
 
     links: list[str] = []
     seen_links: set[str] = set()
+    html_tag_match_count = 0
 
     for target_node in soup.select(target_selector):
         candidate_nodes = [target_node] if use_target_directly else target_node.select(link_selector)
@@ -1526,13 +1548,14 @@ def extract_links_from_rule(soup: BeautifulSoup, page_url: str, rule: dict[str, 
             value = extract_rule_value(candidate_node, attr_name)
             if not value:
                 continue
+            html_tag_match_count += 1
             full_link = urljoin(page_url, value)
             if full_link in seen_links:
                 continue
             seen_links.add(full_link)
             links.append(full_link)
 
-    return links
+    return {"links": links, "html_tag_match_count": html_tag_match_count}
 
 
 def normalize_target_selector(target: str) -> str:

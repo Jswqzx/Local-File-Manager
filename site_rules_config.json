@@ -7,7 +7,7 @@
       "children": [
         {
           "site_name": "source_detail",
-          "match_url": "regex:^https:\\/\\/misskon\\.com/[\\w-]+",
+          "match_url": "regex:^https:\\/\\/misskon\\.com/[\\w-]+\\/",
           "rule_json": "{\n  \"step\": 1,\n  \"fetch_mode\": \"background\",\n  \"target\": \"p a.shortc-button medium green\",\n  \"link_selector\": \"a\",\n  \"attr\": \"href\"\n}",
           "children": []
         }
