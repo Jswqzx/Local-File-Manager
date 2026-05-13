@@ -6,36 +6,101 @@ CONFIG_FILE = Path(__file__).resolve().parent.parent / "file_update_config.json"
 RULES_FILE = Path(__file__).resolve().parent.parent / "site_rules_config.json"
 
 
-def load_file_update_rows() -> list[dict[str, str]]:
+def load_file_update_rows() -> list[dict[str, object]]:
     if not CONFIG_FILE.exists():
         return []
 
     try:
         data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return []
 
     if not isinstance(data, list):
         return []
 
-    rows: list[dict[str, str]] = []
+    rows: list[dict[str, object]] = []
     for row in data:
         if not isinstance(row, dict):
             continue
+        resources = row.get("resources", [])
+        normalized_resources: list[dict[str, str]] = []
+        if isinstance(resources, list):
+            for item in resources:
+                if not isinstance(item, dict):
+                    continue
+                normalized_resources.append(
+                    {
+                        "name": str(item.get("name", "")).strip(),
+                        "detail_url": str(item.get("detail_url", "")).strip(),
+                        "download_url": str(item.get("download_url", "")).strip(),
+                    }
+                )
+        resources_by_param = row.get("resources_by_param", {})
+        normalized_resources_by_param: dict[str, list[dict[str, str]]] = {}
+        if isinstance(resources_by_param, dict):
+            for params_text, items in resources_by_param.items():
+                if not isinstance(params_text, str) or not isinstance(items, list):
+                    continue
+                normalized_items: list[dict[str, str]] = []
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    normalized_items.append(
+                        {
+                            "name": str(item.get("name", "")).strip(),
+                            "detail_url": str(item.get("detail_url", "")).strip(),
+                            "download_url": str(item.get("download_url", "")).strip(),
+                        }
+                    )
+                normalized_resources_by_param[params_text.strip()] = normalized_items
         rows.append(
             {
                 "url": str(row.get("url", "")).strip(),
                 "params": str(row.get("params", "")).strip(),
+                "resources": normalized_resources,
+                "resources_by_param": normalized_resources_by_param,
             }
         )
     return rows
 
 
-def save_file_update_rows(rows: list[dict[str, str]]) -> None:
+def save_file_update_rows(rows: list[dict[str, object]]) -> None:
     normalized_rows = [
         {
             "url": str(row.get("url", "")).strip(),
             "params": str(row.get("params", "")).strip(),
+            "resources": [
+                {
+                    "name": str(item.get("name", "")).strip(),
+                    "detail_url": str(item.get("detail_url", "")).strip(),
+                    "download_url": str(item.get("download_url", "")).strip(),
+                }
+                for item in row.get("resources", [])
+                if isinstance(item, dict)
+                and (
+                    str(item.get("name", "")).strip()
+                    or str(item.get("detail_url", "")).strip()
+                    or str(item.get("download_url", "")).strip()
+                )
+            ],
+            "resources_by_param": {
+                str(params_text).strip(): [
+                    {
+                        "name": str(item.get("name", "")).strip(),
+                        "detail_url": str(item.get("detail_url", "")).strip(),
+                        "download_url": str(item.get("download_url", "")).strip(),
+                    }
+                    for item in items
+                    if isinstance(item, dict)
+                    and (
+                        str(item.get("name", "")).strip()
+                        or str(item.get("detail_url", "")).strip()
+                        or str(item.get("download_url", "")).strip()
+                    )
+                ]
+                for params_text, items in row.get("resources_by_param", {}).items()
+                if str(params_text).strip() and isinstance(items, list)
+            },
         }
         for row in rows
         if str(row.get("url", "")).strip()
@@ -52,7 +117,7 @@ def load_site_rules() -> dict[str, list[dict[str, object]]]:
 
     try:
         data = json.loads(RULES_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return {}
 
     if not isinstance(data, dict):
@@ -92,6 +157,7 @@ def _normalize_rule_items(items: list[dict[str, object]]) -> list[dict[str, obje
             {
                 "site_name": str(item.get("site_name", "")).strip(),
                 "match_url": str(item.get("match_url", "")).strip(),
+                "purpose": str(item.get("purpose", "")).strip(),
                 "rule_json": str(item.get("rule_json", "")).strip(),
                 "children": _normalize_rule_items(children) if isinstance(children, list) else [],
             }

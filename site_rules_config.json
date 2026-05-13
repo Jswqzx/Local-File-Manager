@@ -1,14 +1,23 @@
 {
   "https://misskon.com/page/1/?": [
     {
-      "site_name": "source_index",
+      "site_name": "Source_Title_Detail",
       "match_url": "regex:^https:\\/\\/misskon\\.com/page/[0-9]*/\\?s=[\\w%]+",
-      "rule_json": "{\n  \"step\": 1,\n  \"fetch_mode\": \"background\",\n  \"target\": \"article.item-list\",\n  \"link_selector\": \"h2.post-box-title a\",\n  \"attr\": \"href\",\n  \"pagination_enabled\":true,\n  \"page_url_template\":\"https://misskon.com/page/{page}/?s=%E8%A0%A2%E6%B2%AB%E6%B2%AB\",\n  \"start_page\":1,\n  \"page_number_selector\":\".pagination a, .page\",\n  \"page_number_attr\":\"text\",\n  \"page_number_regex\":\"\\\\d+\",\n  \"max_page_limit\":200\n}",
+      "purpose": "resource_sync",
+      "rule_json": "{\n  \"step\": 1,\n  \"fetch_mode\": \"background\",\n  \"target\": \"article.item-list\",\n  \"link_selector\": \"h2.post-box-title a\",\n  \"attr\": \"href\",\n  \"resource_name_selector\": \"h2.post-box-title a\",\n  \"resource_name_attr\": \"text\",\n  \"page_option\": {\n    \"page_url_template\": \"https://misskon.com/page/{page}/?{params}\",\n    \"start_page\": 1,\n    \"page_number_selector\": \"div.pagination a.page, div.pagination span.current\",\n    \"page_number_regex\": \"\\\\d+\",\n    \"max_page_limit\": 200\n  }\n}",
+      "children": []
+    },
+    {
+      "site_name": "Source_Down_URL",
+      "match_url": "regex:^https:\\/\\/misskon\\.com/[\\w%-]+\\/",
+      "purpose": "download_resolve",
+      "rule_json": "{\n  \"step\": 1,\n  \"fetch_mode\": \"background\",\n  \"target\": \"p\",\n  \"link_selector\": \"a.shortc-button.medium.green\",\n  \"attr\": \"href\"\n}",
       "children": [
         {
-          "site_name": "source_detail",
-          "match_url": "regex:^https:\\/\\/misskon\\.com/[\\w-]+\\/",
-          "rule_json": "{\n  \"step\": 1,\n  \"fetch_mode\": \"background\",\n  \"target\": \"p a.shortc-button medium green\",\n  \"link_selector\": \"a\",\n  \"attr\": \"href\"\n}",
+          "site_name": "Source_Verification",
+          "match_url": "regex:^https:\\/\\/ouo\\.io/[\\w]+",
+          "purpose": "download_resolve",
+          "rule_json": "{\n  \"step\": 1,\n  \"fetch_mode\": \"browser\",\n  \"target\": \"div.download_link\",\n  \"link_selector\": \"a#downloadButton\",\n  \"attr\": \"href\",\n  \"browser_option\":{\n    \"headless\": false,\n    \"actions\":[\n        {\n          \"type\": \"wait_for_selector\",\n          \"selector\": \"button#btn-main:not(.disable):not([disabled]), a#btn-main, button#btn-main, a.btn-main, button.btn-main\",\n          \"timeout_ms\": 45000\n        },\n        {\n          \"type\": \"click\",\n          \"selector\": \"button#btn-main:not(.disable):not([disabled]), a#btn-main, button#btn-main, a.btn-main, button.btn-main\",\n          \"wait_after_ms\": 3000,\n          \"no_wait_after\": true\n        },\n        {\n          \"type\": \"wait_for_load\",\n          \"state\": \"domcontentloaded\",\n          \"timeout_ms\": 15000,\n          \"optional\": true\n        },\n        {\n          \"type\": \"wait_for_selector\",\n          \"selector\": \"button#btn-main:not(.disable):not([disabled]), a#btn-main, button#btn-main, a.btn-main, button.btn-main\",\n          \"timeout_ms\": 20000,\n          \"optional\": true\n        },\n        {\n          \"type\": \"click\",\n          \"selector\": \"button#btn-main:not(.disable):not([disabled]), a#btn-main, button#btn-main, a.btn-main, button.btn-main\",\n          \"wait_after_ms\": 3000,\n          \"no_wait_after\": true,\n          \"optional\": true\n        },\n        {\n          \"type\": \"sleep\",\n          \"duration_ms\": 5000\n        }\n    ],\n  }\n}",
           "children": []
         }
       ]
