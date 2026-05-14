@@ -8,6 +8,7 @@ from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup
 from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QColor, QFont
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -20,6 +21,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
@@ -34,6 +36,10 @@ from PyQt6.QtWidgets import (
 
 
 _SHARED_BROWSER_SESSIONS: dict[bool, dict[str, object]] = {}
+
+
+class HumanVerificationRequiredError(RuntimeError):
+    pass
 
 
 def close_shared_browser_sessions() -> None:
@@ -64,13 +70,14 @@ atexit.register(close_shared_browser_sessions)
 
 class FetchRowDispatcher(QObject):
     start_fetch = pyqtSignal(str, object, str)
+    start_resolve_fetch = pyqtSignal(object, object)
     shutdown = pyqtSignal()
 
 
 class FetchRowWorker(QObject):
     progress = pyqtSignal(int, int, str)
     finished = pyqtSignal(int, int, object)
-    failed = pyqtSignal(str, str)
+    failed = pyqtSignal(str, str, object)
 
     @pyqtSlot(str, object, str)
     def run_fetch(self, full_url: str, child_rules: object, purpose: str) -> None:
@@ -78,8 +85,11 @@ class FetchRowWorker(QObject):
 
         try:
             html_text = fetch_html(full_url)
+        except HumanVerificationRequiredError as exc:
+            self.failed.emit("检测到人机验证", str(exc), None)
+            return
         except Exception as exc:
-            self.failed.emit("入口页获取失败", f"获取 HTML 失败: {exc}")
+            self.failed.emit("入口页获取失败", f"获取 HTML 失败: {exc}", None)
             return
 
         rules = child_rules if isinstance(child_rules, list) else []
@@ -103,6 +113,103 @@ class FetchRowWorker(QObject):
                 parsed_links.append(link)
 
         self.finished.emit(total_pages, len(parsed_links), collect_resource_records(matched_results, purpose))
+
+    @pyqtSlot(object, object)
+    def run_resolve_fetch(self, resources: object, child_rules: object) -> None:
+        resource_items = normalize_resource_items(resources)
+        rules = child_rules if isinstance(child_rules, list) else []
+        total_items = len(resource_items)
+        resolved_resources: list[dict[str, str]] = []
+        resolved_link_count = 0
+        total_pages = 0
+
+        for item_index, resource_item in enumerate(resource_items, start=1):
+            detail_url = str(resource_item.get("detail_url", "")).strip()
+            resource_name = str(resource_item.get("name", "")).strip()
+            existing_download_url = str(resource_item.get("download_url", "")).strip()
+            if not detail_url:
+                continue
+
+            self.progress.emit(item_index - 1, max(1, total_items), f"正在请求资源详情页: {detail_url}")
+            try:
+                html_text = fetch_html(detail_url)
+            except HumanVerificationRequiredError as exc:
+                self.failed.emit(
+                    "检测到人机验证",
+                    str(exc),
+                    {
+                        "resources": resolved_resources,
+                        "total_pages": total_pages,
+                        "resolved_link_count": resolved_link_count,
+                    },
+                )
+                return
+            except Exception as exc:
+                self.failed.emit(
+                    "资源详情页获取失败",
+                    f"获取 HTML 失败: {exc}\n{detail_url}",
+                    {
+                        "resources": resolved_resources,
+                        "total_pages": total_pages,
+                        "resolved_link_count": resolved_link_count,
+                    },
+                )
+                return
+
+            def report_nested_progress(current: int, total: int, message: str) -> None:
+                del current, total
+                self.progress.emit(
+                    item_index - 1,
+                    max(1, total_items),
+                    f"[{item_index}/{max(1, total_items)}] {message}",
+                )
+
+            matched_results = parse_links_by_rules(
+                html_text,
+                detail_url,
+                rules,
+                purpose="download_resolve",
+                progress_callback=report_nested_progress,
+            )
+            total_pages += sum(count_result_pages(result) for result in matched_results)
+
+            item_results = collect_resource_records(matched_results, "download_resolve")
+            unique_download_urls: list[str] = []
+            seen_download_urls: set[str] = set()
+            for result_item in item_results:
+                result_detail_url = str(result_item.get("detail_url", "")).strip()
+                download_url = str(result_item.get("download_url", "")).strip()
+                if result_detail_url != detail_url or not download_url or download_url in seen_download_urls:
+                    continue
+                seen_download_urls.add(download_url)
+                unique_download_urls.append(download_url)
+
+            if unique_download_urls:
+                for download_url in unique_download_urls:
+                    resolved_resources.append(
+                        {
+                            "name": resource_name,
+                            "detail_url": detail_url,
+                            "download_url": download_url,
+                        }
+                    )
+                resolved_link_count += len(unique_download_urls)
+            else:
+                resolved_resources.append(
+                    {
+                        "name": resource_name,
+                        "detail_url": detail_url,
+                        "download_url": existing_download_url,
+                    }
+                )
+
+            self.progress.emit(
+                item_index,
+                max(1, total_items),
+                f"已完成 {item_index}/{max(1, total_items)} 个资源",
+            )
+
+        self.finished.emit(total_pages, resolved_link_count, resolved_resources)
 
     @pyqtSlot()
     def shutdown_worker(self) -> None:
@@ -293,12 +400,13 @@ def show_file_update_dialog(
         entry_url: normalize_child_rules(items)
         for entry_url, items in current_rules.items()
     }
-    fetch_state = {"running": False}
+    fetch_state = {"running": False, "purpose": ""}
     fetch_thread = QThread(dialog)
     fetch_worker = FetchRowWorker()
     fetch_dispatcher = FetchRowDispatcher()
     fetch_worker.moveToThread(fetch_thread)
     fetch_dispatcher.start_fetch.connect(fetch_worker.run_fetch)
+    fetch_dispatcher.start_resolve_fetch.connect(fetch_worker.run_resolve_fetch)
     fetch_dispatcher.shutdown.connect(fetch_worker.shutdown_worker)
     fetch_thread.start()
 
@@ -316,7 +424,7 @@ def show_file_update_dialog(
         progress_bar.setValue(max(1, total_pages))
         progress_status.setText(f"抓取完成，共 {total_pages} 页，{link_count} 个链接")
 
-    def handle_fetch_failed(status_text: str, detail_text: str) -> None:
+    def handle_fetch_failed(status_text: str, detail_text: str, _: object) -> None:
         fetch_state["running"] = False
         progress_bar.setRange(0, 1)
         progress_bar.setValue(0)
@@ -1137,6 +1245,43 @@ def normalize_params_text(params_text: str) -> str:
     return cleaned
 
 
+def detect_human_verification(page_url: str, html_text: str) -> str:
+    normalized_url = page_url.strip().lower()
+    normalized_html = html_text.lower()
+    signals = [
+        ("cloudflare", "Cloudflare"),
+        ("turnstile", "Turnstile"),
+        ("g-recaptcha", "reCAPTCHA"),
+        ("h-captcha", "hCaptcha"),
+        ("verify you are human", "Verify you are human"),
+        ("verification required", "Verification required"),
+        ("security check", "Security check"),
+        ("are you human", "Are you human"),
+        ("access denied", "Access denied"),
+        ("attention required", "Attention required"),
+        ("just a moment", "Just a moment"),
+        ("captcha", "CAPTCHA"),
+        ("人机验证", "人机验证"),
+        ("安全验证", "安全验证"),
+        ("访问受限", "访问受限"),
+        ("机器人", "机器人"),
+        ("验证您是真人", "验证您是真人"),
+    ]
+    for keyword, label in signals:
+        if keyword in normalized_url or keyword in normalized_html:
+            return label
+    return ""
+
+
+def ensure_not_human_verification(page_url: str, html_text: str) -> None:
+    detected_signal = detect_human_verification(page_url, html_text)
+    if not detected_signal:
+        return
+    raise HumanVerificationRequiredError(
+        f"检测到人机验证页面，已停止后续请求。命中特征: {detected_signal} | URL: {page_url}"
+    )
+
+
 def fetch_html(url: str) -> str:
     request = Request(
         url,
@@ -1152,9 +1297,11 @@ def fetch_html(url: str) -> str:
         raw_data = response.read()
         charset = response.headers.get_content_charset() or "utf-8"
         try:
-            return raw_data.decode(charset)
+            html_text = raw_data.decode(charset)
         except UnicodeDecodeError:
-            return raw_data.decode("utf-8", errors="replace")
+            html_text = raw_data.decode("utf-8", errors="replace")
+    ensure_not_human_verification(response.geturl(), html_text)
+    return html_text
 
 
 def build_default_export_filename(url_text: str) -> str:
@@ -1338,6 +1485,8 @@ def execute_rules_for_page(
                     try:
                         cached_html_text = fetch_html(page_url)
                         page_title = extract_html_title(cached_html_text)
+                    except HumanVerificationRequiredError:
+                        raise
                     except Exception as exc:
                         print(f"{indent}当前页面：{page_url}")
                         print(f"{indent}规则 {rule_index}/{total_rules} - {site_name} - 页面请求失败：{exc}")
@@ -1353,6 +1502,8 @@ def execute_rules_for_page(
                     page_url,
                     rule,
                 ) or page_title
+        except HumanVerificationRequiredError:
+            raise
         except ValueError as exc:
             print(f"{indent}当前页面：{page_url}")
             print(f"{indent}规则 {rule_index}/{total_rules} - {site_name} - 规则执行失败：{exc}")
@@ -1496,6 +1647,66 @@ def normalize_resource_items(items: object) -> list[dict[str, str]]:
             }
         )
     return normalized_items
+
+
+def merge_resolved_resource_items(
+    existing_items: object,
+    resolved_items: object,
+) -> list[dict[str, str]]:
+    normalized_existing = normalize_resource_items(existing_items)
+    normalized_resolved = normalize_resource_items(resolved_items)
+    resolved_by_detail_url: dict[str, list[dict[str, str]]] = {}
+
+    for item in normalized_resolved:
+        detail_url = str(item.get("detail_url", "")).strip()
+        download_url = str(item.get("download_url", "")).strip()
+        if not detail_url:
+            continue
+        resolved_by_detail_url.setdefault(detail_url, [])
+        if download_url:
+            resolved_by_detail_url[detail_url].append(item)
+
+    merged_items: list[dict[str, str]] = []
+    seen_keys: set[tuple[str, str, str]] = set()
+
+    for existing_item in normalized_existing:
+        detail_url = str(existing_item.get("detail_url", "")).strip()
+        matched_items = resolved_by_detail_url.get(detail_url, [])
+        if matched_items:
+            for resolved_item in matched_items:
+                merged_item = {
+                    "name": str(resolved_item.get("name", "")).strip() or str(existing_item.get("name", "")).strip(),
+                    "detail_url": detail_url,
+                    "download_url": str(resolved_item.get("download_url", "")).strip(),
+                }
+                item_key = (
+                    merged_item["name"],
+                    merged_item["detail_url"],
+                    merged_item["download_url"],
+                )
+                if item_key in seen_keys:
+                    continue
+                seen_keys.add(item_key)
+                merged_items.append(merged_item)
+            continue
+
+        item_key = (
+            str(existing_item.get("name", "")).strip(),
+            detail_url,
+            str(existing_item.get("download_url", "")).strip(),
+        )
+        if item_key in seen_keys:
+            continue
+        seen_keys.add(item_key)
+        merged_items.append(
+            {
+                "name": item_key[0],
+                "detail_url": item_key[1],
+                "download_url": item_key[2],
+            }
+        )
+
+    return merged_items
 
 
 def build_resource_name(page_title: str, page_url: str) -> str:
@@ -1699,10 +1910,19 @@ def show_resource_dialog(
     resource_panel.setSpacing(6)
     content_row.addLayout(resource_panel, 3)
 
+    resource_header_row = QHBoxLayout()
     resource_count_label = QLabel("资源数量: 0")
-    resource_panel.addWidget(resource_count_label)
+    sort_resources_button = QPushButton("未补全优先")
+    sort_resources_button.setCheckable(True)
+    resource_header_row.addWidget(resource_count_label)
+    resource_header_row.addStretch()
+    resource_header_row.addWidget(sort_resources_button)
+    resource_panel.addLayout(resource_header_row)
 
     resource_list = QListWidget()
+    resource_list_font = QFont(resource_list.font())
+    resource_list_font.setBold(True)
+    resource_list.setFont(resource_list_font)
     resource_panel.addWidget(resource_list)
 
     progress_status = QLabel("等待加载资源")
@@ -1713,7 +1933,7 @@ def show_resource_dialog(
     progress_bar.setValue(0)
     layout.addWidget(progress_bar)
 
-    fetch_state = {"running": False}
+    fetch_state = {"running": False, "purpose": "", "params_text": ""}
     resources_cache: dict[str, list[dict[str, str]]] = {
         str(params_text).strip(): normalize_resource_items(items)
         for params_text, items in row_data.get("resources_by_param", {}).items()
@@ -1724,8 +1944,30 @@ def show_resource_dialog(
     fetch_dispatcher = FetchRowDispatcher()
     fetch_worker.moveToThread(fetch_thread)
     fetch_dispatcher.start_fetch.connect(fetch_worker.run_fetch)
+    fetch_dispatcher.start_resolve_fetch.connect(fetch_worker.run_resolve_fetch)
     fetch_dispatcher.shutdown.connect(fetch_worker.shutdown_worker)
     fetch_thread.start()
+    displayed_resources: list[dict[str, str]] = []
+
+    def sort_resources_by_completion(resources: list[dict[str, str]]) -> list[dict[str, str]]:
+        if not sort_resources_button.isChecked():
+            return list(resources)
+        return sorted(
+            resources,
+            key=lambda item: (
+                0 if not str(item.get("download_url", "")).strip() else 1,
+                str(item.get("name", "")).strip().lower(),
+                str(item.get("detail_url", "")).strip().lower(),
+            ),
+        )
+
+    def update_sort_button_text() -> None:
+        sort_resources_button.setText("未补全优先" if sort_resources_button.isChecked() else "原始顺序")
+
+    def refresh_visible_resources(resources: list[dict[str, str]]) -> None:
+        nonlocal displayed_resources
+        displayed_resources = sort_resources_by_completion(resources)
+        populate_resource_list(displayed_resources)
 
     def current_params_texts() -> list[str]:
         selected_rows = sorted({item.row() for item in params_table.selectedItems()})
@@ -1740,6 +1982,9 @@ def show_resource_dialog(
     def current_primary_params_text() -> str:
         params_texts = current_params_texts()
         return params_texts[0] if params_texts else ""
+
+    def current_resources_for_params(params_text: str) -> list[dict[str, str]]:
+        return normalize_resource_items(resources_cache.get(params_text, []))
 
     def sync_row_data_from_table() -> None:
         params_items: list[str] = []
@@ -1790,27 +2035,70 @@ def show_resource_dialog(
         resource_list.clear()
         resource_count_label.setText(f"资源数量: {len(resources)}")
         for resource_item in resources:
-            resource_list.addItem(resource_item.get("name", ""))
+            list_item = QListWidgetItem(resource_item.get("name", ""))
+            download_url = str(resource_item.get("download_url", "")).strip()
+            if download_url:
+                list_item.setBackground(QColor("#14532d"))
+                list_item.setForeground(QColor("#f7fee7"))
+            else:
+                list_item.setBackground(QColor("#991b1b"))
+                list_item.setForeground(QColor("#ffffff"))
+            list_item.setData(Qt.ItemDataRole.UserRole, resource_item)
+            resource_list.addItem(list_item)
         if not resources:
             resource_list.addItem("当前参数暂无资源")
 
     def handle_fetch_finished(total_pages: int, link_count: int, resources: object) -> None:
         fetch_state["running"] = False
+        fetch_purpose = str(fetch_state.get("purpose", "")).strip()
+        params_text = str(fetch_state.get("params_text", "")).strip()
+        fetch_state["purpose"] = ""
+        fetch_state["params_text"] = ""
         progress_bar.setRange(0, max(1, total_pages))
         progress_bar.setValue(max(1, total_pages))
         progress_status.setText(f"抓取完成，共 {total_pages} 页，{link_count} 个链接")
         normalized_resources = normalize_resource_items(resources)
-        params_text = current_primary_params_text()
-        resources_cache[params_text] = normalized_resources
+        if fetch_purpose == "download_resolve":
+            resources_cache[params_text] = merge_resolved_resource_items(
+                current_resources_for_params(params_text),
+                normalized_resources,
+            )
+        else:
+            resources_cache[params_text] = normalized_resources
         sync_row_data_from_table()
         handle_params_selected()
 
-    def handle_fetch_failed(status_text: str, detail_text: str) -> None:
+    def handle_fetch_failed(status_text: str, detail_text: str, payload: object) -> None:
+        fetch_purpose = str(fetch_state.get("purpose", "")).strip()
+        params_text = str(fetch_state.get("params_text", "")).strip()
         fetch_state["running"] = False
+        fetch_state["purpose"] = ""
+        fetch_state["params_text"] = ""
+        payload_data = payload if isinstance(payload, dict) else {}
+        partial_resources = normalize_resource_items(payload_data.get("resources", []))
+        partial_link_count = parse_int_value(payload_data.get("resolved_link_count"), 0)
+        partial_page_count = parse_int_value(payload_data.get("total_pages"), 0)
+        if fetch_purpose == "download_resolve" and params_text and partial_resources:
+            resources_cache[params_text] = merge_resolved_resource_items(
+                current_resources_for_params(params_text),
+                partial_resources,
+            )
+            sync_row_data_from_table()
+            handle_params_selected()
         progress_bar.setRange(0, 1)
         progress_bar.setValue(0)
-        progress_status.setText(status_text)
-        QMessageBox.warning(dialog, "提示", detail_text)
+        progress_status.setText(
+            f"{status_text}，已保存 {partial_link_count} 个下载链接"
+            if partial_link_count > 0
+            else status_text
+        )
+        warning_text = detail_text
+        if fetch_purpose == "download_resolve" and partial_resources:
+            warning_text += (
+                f"\n\n已在停止前保存当前结果：{partial_link_count} 个下载链接，"
+                f"涉及 {len(partial_resources)} 条资源记录，累计处理页数 {partial_page_count}。"
+            )
+        QMessageBox.warning(dialog, "提示", warning_text)
 
     fetch_worker.progress.connect(update_progress)
     fetch_worker.finished.connect(handle_fetch_finished)
@@ -1819,13 +2107,30 @@ def show_resource_dialog(
     def fetch_resources(purpose: str = "") -> None:
         if fetch_state["running"]:
             return
-        url_text = str(row_data.get("url", "")).strip()
         params_text = current_primary_params_text()
+        fetch_state["purpose"] = purpose
+        fetch_state["params_text"] = params_text
+        fetch_state["running"] = True
+        if purpose == "download_resolve":
+            resources = current_resources_for_params(params_text)
+            if not resources:
+                fetch_state["running"] = False
+                fetch_state["purpose"] = ""
+                fetch_state["params_text"] = ""
+                QMessageBox.information(dialog, "提示", "当前参数下没有可补全的资源详情页。")
+                return
+            update_progress(0, max(1, len(resources)), f"正在从资源详情页补全下载链接: {len(resources)} 个资源")
+            fetch_dispatcher.start_resolve_fetch.emit(resources, child_rules)
+            return
+
+        url_text = str(row_data.get("url", "")).strip()
         if not url_text:
+            fetch_state["running"] = False
+            fetch_state["purpose"] = ""
+            fetch_state["params_text"] = ""
             QMessageBox.warning(dialog, "提示", "请先输入网站。")
             return
         full_url = build_url_with_params(url_text, params_text)
-        fetch_state["running"] = True
         update_progress(0, 0, f"正在请求入口页: {full_url}")
         fetch_dispatcher.start_fetch.emit(full_url, child_rules, purpose)
 
@@ -1857,26 +2162,12 @@ def show_resource_dialog(
         progress_status.setText("已加载本地资源" if aggregated_resources else "当前参数暂无已保存资源")
         progress_bar.setRange(0, 1)
         progress_bar.setValue(1 if aggregated_resources else 0)
-        populate_resource_list(aggregated_resources)
+        refresh_visible_resources(aggregated_resources)
 
     def show_selected_resource(item_index: int) -> None:
-        params_texts = current_params_texts()
-        resources: list[dict[str, str]] = []
-        seen_resource_keys: set[tuple[str, str, str]] = set()
-        for params_text in params_texts:
-            for resource_item in resources_cache.get(params_text, []):
-                resource_key = (
-                    resource_item.get("name", ""),
-                    resource_item.get("detail_url", ""),
-                    resource_item.get("download_url", ""),
-                )
-                if resource_key in seen_resource_keys:
-                    continue
-                seen_resource_keys.add(resource_key)
-                resources.append(resource_item)
-        if item_index < 0 or item_index >= len(resources):
+        if item_index < 0 or item_index >= len(displayed_resources):
             return
-        show_resource_detail_dialog(dialog, resources[item_index])
+        show_resource_detail_dialog(dialog, displayed_resources[item_index])
 
     def add_params_row() -> None:
         row_index = append_params_row("")
@@ -1931,6 +2222,7 @@ def show_resource_dialog(
     params_table.itemSelectionChanged.connect(handle_params_selected)
     sync_resources_button.clicked.connect(sync_resources)
     resolve_links_button.clicked.connect(resolve_links)
+    sort_resources_button.toggled.connect(lambda _: (update_sort_button_text(), handle_params_selected()))
     add_params_button.clicked.connect(add_params_row)
     delete_params_button.clicked.connect(delete_selected_params_rows)
     resource_list.itemDoubleClicked.connect(
@@ -1941,6 +2233,7 @@ def show_resource_dialog(
     initial_params = [item.strip() for item in initial_params_text.splitlines()]
     if not initial_params:
         initial_params = [""]
+    update_sort_button_text()
     for params_text in initial_params:
         append_params_row(params_text)
     initial_resources_by_param = {
@@ -2332,6 +2625,7 @@ def collect_links_from_browser_rule(
 
             html_text = page.content()
             final_page_url = page.url
+            ensure_not_human_verification(final_page_url, html_text)
         finally:
             page.close()
     except PlaywrightError as exc:
@@ -2401,6 +2695,7 @@ def collect_links_from_rule_across_pages(
     pagination_config = get_pagination_config(rule)
     if not pagination_config["enabled"]:
         soup = BeautifulSoup(initial_html_text, "html.parser")
+        ensure_not_human_verification(initial_page_url, initial_html_text)
         extraction_result = extract_links_from_rule(soup, initial_page_url, rule)
         if progress_callback is not None:
             progress_callback(1, 1, "当前规则无需翻页")
@@ -2440,10 +2735,13 @@ def collect_links_from_rule_across_pages(
             )
             try:
                 html_text = fetch_html(page_url)
+            except HumanVerificationRequiredError:
+                raise
             except Exception:
                 continue
 
         visited_pages.add(page_number)
+        ensure_not_human_verification(page_url, html_text)
         soup = BeautifulSoup(html_text, "html.parser")
         extraction_result = extract_links_from_rule(soup, page_url, rule)
         total_html_tag_match_count += parse_int_value(
